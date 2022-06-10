@@ -1,0 +1,265 @@
+---
+title: "Forecasting UK Electricity Demand"
+author: "Anoushka Ghosh"
+date: '2022-05-29'
+output: pdf_document
+---
+
+
+
+```{r}
+##loading the libraries needed
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tidyverse)
+library(corrplot)
+library(mgcv)
+library(forecast)
+library(lubridate)
+
+
+
+# packages = c("ggplot2", "dplyr", "tidyr", "data.table", "corrplot", "gridExtra", "forecast", "tseries", "TSA", "tibble", "TTR", "xts", "dygraphs", "assertthat", "Matrix", "tidyverse", "lubridate", "hms")
+# 
+# my.install <- function(pkg, ...){
+#   if (!(pkg %in% installed.packages()[,1])){
+#     install.packages(pkg)
+#   }
+#   return(library(pkg, ...))
+# }
+# 
+# purrr::walk(packages, my.install, character.only = TRUE, warn.conflicts = FALSE)
+
+```
+
+
+
+```{r}
+##loading the data
+load("UKL.RDa")
+ukdata <- data.frame(UKL)
+
+##view the head
+head(ukdata)
+```
+
+```{r}
+
+dim(ukdata) ## ~90000 observations and 15 variables
+
+##see structure of data
+str(ukdata)
+
+```
+Notes:
+1. Month and year is int; should change to factor
+2.Sun=1,Sat=7
+
+
+```{r}
+##check for missing values
+sum(is.na(ukdata)) ##no missing values
+
+```
+
+```{r}
+
+##make separate columns for  
+ukdata <- ukdata %>%
+  mutate(onlydate = as.Date(date,format = "%d/%m/%Y"), ##only date without time
+         monthfactor = factor(month), ##month as factor
+         yearfactor = factor(year), ##year as factor
+         todfactor = factor(tod)  ##time of day as factor
+         )
+
+##summarize the data
+summary(ukdata)
+
+```
+
+
+
+```{r}
+boxplot(ukdata$load,xlab=" Grid Load", main="Boxplot for Grid Load ")
+```
+```{r}
+##distribution of load 
+p1 <- ggplot(ukdata, aes(load)) + 
+                      geom_histogram(bins = 50, 
+                                     col = "red",
+                                     fill = "red",
+                                     alpha = 0.3) +
+                      geom_density(alpha = 0.1)
+
+p1
+```
+
+```{r}
+
+# get the correlation matrix
+cormat <- ukdata %>%
+  select(-date) %>%
+  select_if(is.numeric) %>%
+  {round(cor(.),2)}
+
+#plot the correlations
+corrplot(cormat,method="number")
+
+```
+Note:
+1. Correlations between the calender effects, which is expected.
+2. Correlations between the weather predictors, again expected.Both are Autocorrelations.
+
+
+
+
+
+## Data Train-Validation Split
+
+```{r}
+##split the data into training and validation set
+train   =  subset(ukdata, year <= 2015)
+validation =  subset(ukdata, year = 2016)
+
+```
+
+```{r}
+##load v/s time
+load.df <- train %>%
+  group_by(onlydate) %>%
+  summarise(mean_load = mean(load))
+
+gg1 <- ggplot(load.df, aes(onlydate, mean_load))+
+  geom_line()+
+  xlab("Time")+
+  ylab(" Electricity Demand (MW)")+
+  theme(aspect.ratio=1/5)
+
+gg1
+```
+```{r}
+##plot load against load48 and also load v/s dow and load against load a week before
+
+##EDA
+
+##load against load
+
+
+
+
+```
+
+## Predictors we are thinking about using
+
+1. Time of Year : toy : Penalized cubic spline, max edf = 20
+2. Day of week  : dow
+3. Lagged Load  : load
+4. Exp. Temperature : temp95
+5. Time of Day : 
+6. Date
+7. Year/month by weekday(Dow)?
+8. Time Count :Time Of Day but just scaled
+
+Interactions:
+1. load48 & temp95/temp
+2. load48 & dow
+3. tod & temp/temp95
+4. toy & temp/ date & temp95
+
+
+
+
+## Which smoothing and basis dimension to use for each predictor
+
+Lets know about the different types of smoothers(splines)
+
+- cc/cr
+
+- ps : P-Splines
+
+- tp : Thin-plate splines 
+
+
+```{r}
+##simple model
+
+response <- "load"
+predictors <- c("s(as.numeric(onlydate), k=20)",
+                "s(toy, k=30, bs='cc')",
+                "s(tod,bs='cr',k=48)",
+                "s(temp95, k=15, bs = 'cs')",
+                
+                "load48",
+                "load48:dow")
+
+f <- as.formula(paste(response,paste(predictors,collapse = "+"),sep = "~"))
+
+mod1 <- bam(formula = f ,data=train, method="REML")
+
+summary(mod1)
+```
+```{r}
+plot(mod1, shade = TRUE, pages = 1, scale = 0)
+```
+
+```{r}
+plot(mod1,pages=1,residuals=TRUE)
+```
+```{r}
+par(mfrow=c(2,2))
+gam.check(mod1)
+```
+
+
+```{r}
+acf(resid(mod1), lag.max = 30, main = "ACF")
+pacf(resid(mod1),lag.max = 30,main="PACF")
+```
+```{r}
+acf(residuals(mod1$lme,type="normalized"),main="standardized residual ACF")
+
+```
+
+
+```{r}
+predictors2 <- c(#"s(as.numeric(onlydate), k=20)", ##not much effect
+                "s(toy, k=50, bs='cc')",
+                "s(tod,bs='cr',k=48)",
+                "s(timeCount, bs='cs',k=48)",
+                "s(temp95, k=15, bs = 'cs')",
+                "te(toy,temp,k=40)",
+                "s(temp,by=dow,k=20)",
+                "te(load48,temp)",
+                #"te(load48,temp95)", dont use this;reduces model performance
+                "load48",
+                "load48:dow")
+
+f2 <- as.formula(paste(response,paste(predictors2,collapse = "+"),sep = "~"))
+```
+
+
+```{r}
+
+mod3 <- bam(formula = f2, data = train, discrete=TRUE)
+
+summary(mod3)
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+gam.check(mod3)
+
+
+
+##low k-vals
+##toy,timecount,te(toy,temp)
+
+
+```
+```{r}
+acf(resid(mod3), lag.max = 50, main = "ACF")
+pacf(resid(mod3),lag.max = 30,main="PACF")
+```
+
