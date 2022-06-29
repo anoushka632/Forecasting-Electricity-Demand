@@ -1,0 +1,588 @@
+---
+title: "Forecasting UK Electricity Demand"
+author: "Anoushka Ghosh"
+date: '2022-05-29'
+output: pdf_document
+---
+
+
+
+```{r}
+##loading the libraries needed
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tidyverse)
+library(corrplot)
+library(lubridate)
+library(xts)
+library(mgcv)
+library(visreg)
+library(Metrics)
+
+```
+
+
+
+```{r}
+##loading the data
+load("UKL.RDa")
+ukdata <- data.frame(UKL)
+
+##view the head
+head(ukdata)
+
+dim(ukdata) ## ~90400 observations and 15 variables
+
+##see structure of data
+str(ukdata)
+
+```
+Notes:
+1. Month and year is int; should change to factor
+2.Sun=1,Sat=7
+
+
+```{r}
+##check for missing values
+sum(is.na(ukdata)) ##no missing values
+
+##summarize the data
+summary(ukdata)
+
+```
+
+
+
+```{r}
+
+##Data Pre-Processing
+
+
+
+## We make some new variables here, 
+## Lagged Variables
+##the first one is just the data variable without the time named onlydate
+##the second and third ones are one and two day lagged temperatures, lagtemp48 & lagtemp96
+##(since we have half-hourly data, 1 day= 48 x 1, 2 day = 48 x 2)
+##the fourth one is the one week (7 day) lagged demand
+
+ukdata <- ukdata %>%
+  mutate(onlydate = as.Date(ymd_hms(date)), ##only date without time
+         lagtemp48 = lag(temp,order_by = onlydate,48), ## one-day lagged temperature
+         lagtemp96 = lag(temp,order_by = onlydate,96), ##two-day lagged temperature
+         load336 = lag(load,order_by = onlydate,336) ##one week lagged load
+         )
+
+
+##the next two variables were made after observing the exploratory data analysis on the training set
+
+##Making new variables:
+## Season Variable: that splits the months into summer and winter seasons
+## The summer and winter months were chosen according to the UK weather
+## April-September was categorized as Summer and 
+## October- March was categorized as Winter
+
+## Weekclass Variable: it splits the days of the week into weekday and weekend
+## Sat & sun categorized as Weekend and Mon-Fri categorized as Weekday
+
+
+ukdata <- ukdata %>%
+  mutate(season = factor(case_when(
+                month %in% c(4,5,6,7,8,9) ~ 1,
+                month %in% c(10,11,12,1,2,3) ~ 2),
+                labels = c("Summer", "Winter")),
+         weekclass = factor(case_when(
+                     dow %in% c("Mon", "Tue", "Wed", "Thu", "Fri") ~ 1,
+                    dow %in% c("Sat", "Sun") ~ 2),labels = c("Weekday", "Weekend")))
+         
+##to check the current structure
+#str(ukdata)
+```
+
+## Examining the electricity load distribution
+
+```{r}
+##box-plot for the load
+boxplot(ukdata$load,xlab = "Grid Load", ylab = 'Grid Load (MW)', main="Boxplot for Grid Load ")
+```
+```{r}
+##density of load 
+p1 <- ggplot(ukdata, aes(load)) + 
+              geom_histogram(bins = 50, col = "red",
+                            fill = "red",alpha = 0.3) +
+              geom_density(alpha = 0.1) +
+              ggtitle("Histogram (Density plot) of Grid Load")
+  
+
+p1
+```
+
+```{r}
+## Check correlations between variables
+
+# get the correlation matrix
+cormat <- ukdata %>%
+  select_if(is.numeric) %>%
+  {round(cor(.),2)}
+
+#plot the correlations
+corrplot(cormat,method="number")
+
+```
+Note:
+1. Correlations between the calender effects, which is expected.
+2. Correlations between the weather predictors, again expected.Both are Auto-correlations.
+
+
+## Data Train-Validation Split
+
+```{r}
+##split the data into training and validation set
+train   =  subset(ukdata, year <= 2015 )
+validation =  subset(ukdata, year == 2016)
+
+```
+
+
+## Data Exploration on the Training set
+
+```{r}
+##load v/s time
+load.df <- train %>%
+  group_by(onlydate) %>% ##ordered  by date
+  summarise(mean_load = mean(load)) ##plotting mean demand each date
+
+ggplot(load.df, aes(onlydate, mean_load))+
+  geom_line()+
+  xlab("Time")+
+  ylab(" Electricity Demand (MW)")+
+  theme(aspect.ratio=1/5) 
+
+
+```
+
+```{r}
+
+##taking a closer look: MArch 2011
+ggplot(subset(train, year == 2011 & month == 3),aes(date,load))+
+  geom_line()+
+  xlab("Time")+
+  ylab(" Electricity Demand (MW)")+
+  theme(aspect.ratio=1/5)
+  
+
+
+```
+```{r}
+##Checking for some irregularity in the trend
+##transition from sunday to monday
+##looking into  March 28 2011.
+ggplot(subset(train, onlydate == "2011-03-28"),
+  aes(date,load))+
+  geom_line()+
+  xlab("Time")+
+  ylab(" Electricity Demand (MW)")
+
+```
+
+
+```{r}
+# Demand by day of the week
+ggplot(train, aes(dow, load)) +
+  geom_boxplot() + xlab('Day') + 
+  ylab('Demand (MW)')+ylim(15000,60000) + 
+  ggtitle('Demand per day of the week')
+```
+
+
+```{r}
+# Demand by time of the day
+options(repr.P.width=8,repr.P.height=4)
+ggplot(train, aes(as.factor(tod), load)) +
+  geom_boxplot() + 
+  xlab('Time of day') +
+  ylab('Demand (MW)')+
+  ylim(15000,60000) + 
+  ggtitle('Demand by the time of the day')
+
+```
+
+```{r}
+
+##avg electricity demand v/s month
+avg_demand_month <- aggregate(load ~ month, train, 'mean') #
+
+ggplot(avg_demand_month, aes(month, load))+
+  geom_line()+
+  xlab("Month")+
+  ylab(" Average Monthly Load (MW)")+
+  theme(aspect.ratio=1/2)
+  
+```
+
+Notes: 
+1. Demand is high during the weekdays and reduces during the weekends.
+ There is a drastic change in load going from Fri-Sat, and then from Sun-Mon. It would be better if we make a weekday and weekend class according to the data provided to us.
+
+2. Demand varies with the time of the day, with increased demand(with outliers) after the 15th half-hourly interval. So load varies according to the time of the day.
+
+3. Average Demand decreases in the summer and is high in the winters, probably because of the need of increased heating in the cold. Probably try splitting the data into summer and winter months and then fitting the model.
+
+We change the data mentioned previously by making two new predictor variables and change the training and validation sets again.(The change is done in the data-processing section after noticing these patterns.)
+
+
+### Demand against Lagged Demands
+
+
+```{r}
+##load against load48
+ ggplot(train, aes(load48, load))+
+  geom_line()+
+  xlab("One Day Lagged Electricity demand")+
+  ylab("Current Electricity Demand (MW)")+
+  theme(aspect.ratio=1/3)+
+  ggtitle("Load v/s One-day lagged Load")
+
+
+```
+```{r, warning=FALSE}
+
+## load against one week lagged load
+ggplot(train, aes(load336, load))+
+  geom_line()+
+  xlab("One-week Lagged Electricity demand")+
+  ylab("Current Electricity Demand (MW)")+
+  ggtitle("Load v/s One-week lagged load")+
+  theme(aspect.ratio=1/3)
+
+```
+
+
+```{r}
+##load v/s smoothed temperature
+
+ggplot(train, aes(temp95, load))+
+  geom_line()+
+  xlab("Temperature")+
+  ylab(" Electricity Demand (MW)")+
+  theme(aspect.ratio=1/3)
+
+##above 20 degrees the electricity demand is less, less heating required
+
+```
+
+
+## Model Fitting
+
+
+```{r}
+
+##variable we are trying to model
+response <- "load"
+
+##predictors for our model
+predictors1 <- c(
+                 
+                "s(toy, k= 20, bs='cc')", ##time of year
+                
+                "s(timeCount, k = 20, bs = 'cr') ", ##Cumulative time scale 
+                
+                "s(tod,bs='cr',k= 20)", ##time of day
+                
+                "s(temp95, k= 15, bs = 'cr')", ##smoothed temperature
+                
+                "s(load48, k = 20, bs='cr')", ## one-day lagged load
+                
+                ##parametric terms
+                "dow" ##day of the week
+                )
+
+##compile the formula
+f1 <- as.formula(paste(response,paste(predictors1,collapse = "+"),sep = "~"))
+
+##model fitting and summary
+mod1 <- bam(formula = f1, data = train, discrete=TRUE)
+summary(mod1)
+
+```
+```{r}
+##model checking
+par(mfrow=c(2,2))
+gam.check(mod1)
+
+```
+
+
+```{r}
+
+##second model
+
+##predictors for our model
+predictors2 <- c( "s(toy, k = 20, bs = 'cc') ", ##time of year 
+                  
+                "s(timeCount, k= 20, bs = 'cr')", ##cumulative time count
+                
+                "s(temp95, k= 10, bs = 'cr')", #smoothed temperature
+                
+                ##Tensor Interactions
+                
+                "te(load48, tod, bs = c('cr', 'cr'))", ##interaction with main effect load48 and time of day
+                
+                "ti(load48, by = weekclass, k = 15)", ## lagged load by day of the week
+                
+                "ti(load48, by = season, k = 15)",
+                
+                "ti(temp95, toy,k = c(15, 20), bs = c('cr', 'cc'))", ##temperature and time of year
+                
+                "ti(toy, tod, k =c(20,20) , bs = c('cc','cr'))", ##time of year and time of day
+                
+                ##parametric terms
+                
+                "dow" ##day of the week
+                )
+                
+##compile the formula
+f2 <- as.formula(paste(response,paste(predictors2,collapse = "+"),sep = "~"))
+
+##model fitting and summary
+mod2 <- bam(formula = f2, data = train, discrete=TRUE)
+summary(mod2)
+
+```
+
+
+```{r}
+##model checking
+par(mfrow=c(2,2))
+gam.check(mod2)
+
+```
+
+
+```{r}
+##final model
+
+##predictors for our model
+predictor5 <- c( "s(toy, k = 15, bs = 'cc')", ##time of year
+                 
+                "s(timeCount, bs = 'cr') ", ##Cumulative time scale
+                
+                "s(temp95, k = 15, bs = 'cr')", #smoothed temperature
+                
+                ##additional lagged variables
+                
+                "s(load336, k = 15, bs = 'cr')", ##week before load
+                 
+                # tensor interaction of one and two day lagged temperature
+                "te(lagtemp48, lagtemp96, k=c(15,15), bs = c('cr', 'cr'))",
+                
+                ## tensor interactions
+
+                "te(load48, tod, k = c(15,20), bs = c('cr', 'cr'))", ##interaction with main effect load48 and time of day
+                 
+                "ti(load48, by = dow, k = 15)", ## lagged load by day of the week
+                
+                "ti(load48, month, bs = c('cr', 'cr') )", ##lagged load by the month
+                
+                "ti(toy,tod, k= c(20,20), bs= c('cc','cr'))", ##temperature and time of year
+                 
+                "ti(temp95, toy, k = c(15, 20), bs = c('cr', 'cc'))", ##interaction between temperature and time of year
+                
+                ##parametric terms
+                
+                "dow" ##day of the week
+                )
+                
+##compile the formula               
+
+f5 <- as.formula(paste(response,paste(predictor5,collapse = "+"),sep = "~"))
+
+##model fitting and summary
+
+mod5 <- bam(formula = f5, data = train, discrete = TRUE)
+
+summary(mod5)
+
+```
+
+
+```{r}
+##model checking
+par(mfrow = c(2,2))
+gam.check(mod5)
+```
+
+
+
+```{r}
+plot(mod5, shade = TRUE, pages = 2, scale = 0)
+```
+
+
+
+```{r}
+##autocorrelation checks
+par(mfrow=c(1,3),mar=c(3,3,3,0))
+acf(resid(mod1), lag.max = 50, main = "ACF for model 1")
+acf(resid(mod2), lag.max = 50, main = "ACF for model 2")
+acf(resid(mod5),lag.max = 50,main="ACF for model 3")
+```
+
+Note:
+There is still autocorrelations in the model, probably because of the additional lagged variables in the model.
+
+
+## Model Performance for our GAM models
+
+```{r}
+##predicted load
+pred1 <- predict.gam(mod1,newdata=validation,type="response")
+pred2 <- predict.gam(mod2,newdata=validation,type="response")
+pred3 <- predict.gam(mod5,newdata=validation,type="response")
+
+##actual values
+actualload <- validation$load
+
+##model performance
+
+##rmse
+rmse1 <- rmse(actualload,pred1)
+rmse2 <- rmse(actualload,pred2)
+rmse3 <- rmse(actualload,pred3)
+
+##mape
+mape1 <- mape(actualload, pred1)
+mape2 <- mape(actualload, pred2)
+mape3 <- mape(actualload, pred3)
+
+
+## AIC to compare models
+AIC(mod1,mod2,mod5)
+
+
+##model performances
+results.df <- data.frame("model" = c("Model 1","Model 2","Model 3"),
+                        "rmse" = c(rmse1,rmse2,rmse3),
+                         "mape" = c(mape1,mape2,mape3))
+
+
+results.df
+
+```
+
+
+
+```{r}
+
+##on the validation data
+
+##data-frame containing the predicted and actual load with dates half hour intervals and day of week
+pred.df <- data.frame(Date= validation$date, Instant = validation$tod ,
+                          DayofWeek= validation$dow,
+                          onlydate =  validation$onlydate,
+                          Predicted = pred3,
+                          Actual = actualload)
+
+##on the training data
+
+##Note: The length of residuals vector is less than the training set,
+##since it contains NA's because of the additional lagged variables created. 
+##So we make a data-frame not containing the NA's and then proceed with the prediction visualizations
+
+##predicted values on the training set
+predtrain <- predict.gam(mod5,type="response")
+
+##residuals of the final model
+resid3 <- residuals.gam(mod5)
+
+##rows in data without NA's
+completedf <- train[complete.cases(train),]
+
+##adding the predicted values on the training data and residuals as columns
+predtrain.df <- completedf %>%
+                add_column(Predicted = predtrain,
+                           Residuals = resid3)
+
+
+```
+
+
+
+```{r}
+##actual v/s predicted load on the validation data
+ggplot(pred.df,                                    
+       aes(x = Predicted,
+           y = Actual)) +
+  geom_point() +
+  xlim(15000,60000) +
+  ylim(15000,60000) +
+  geom_abline(intercept = 0,
+              slope = 1,
+              color = "red",
+              size = 0.5)
+
+```
+
+```{r}
+##subsetting the date with the irregularity which was a monday
+march.df <- subset(predtrain.df, onlydate == "2011-03-28")
+
+####melt the data-frame into a long format to plot it
+predict.long <- melt(march.df[,c("date","load","Predicted")], id.vars="date")
+
+ggplot(subset(predict.long),                                    
+       aes(x = date, y = value,col= variable)) +
+       geom_line(size = 1) +
+       ylab("Actual and Predicted values for load") +
+       labs(title= "Actual and Predicted Load for March 28 2011", color="")+
+        scale_fill_discrete(labels = c("Actual Load","Predicted Load"))
+
+##Note : tends to underestimate in the first hours(from 6 am to 1130 am) of the day and then overestimate slightly
+  
+
+```
+
+
+
+```{r}
+##actual v/s predicted load for 18th jan 2016
+jan.2016 <- subset(pred.df, onlydate == "2016-01-18")
+
+##melt the data-frame into a long format to plot it
+predict.2016 <- melt(jan.2016[,c("Date","Actual","Predicted")], id.vars="Date")
+
+ggplot(subset(predict.2016),                                    
+       aes(x = Date, y = value,col= variable)) +
+       geom_line(size = 1) +
+       ylab("Actual and Predicted values") +
+       labs(title= "Actual and Predicted Load for 18 January 2016", color="")+
+        scale_fill_discrete(labels = c("Actual Load","Predicted Load"))
+
+```
+
+```{r}
+##residuals by time of the year colored by tod
+ggplot(predtrain.df,aes(toy,Residuals, color = tod))+
+  geom_point()+
+  labs(title = "Residuals over the time of the year", x="Time of the year", color = "Time of the Day")
+
+```
+
+
+```{r}
+##checking residuals by the day of the week
+##There are some outliers for each day.
+
+ggplot(predtrain.df,aes(dow,Residuals,fill=dow))+
+  geom_boxplot()+
+  labs(title = "Residuals by the Day of the Week", x="Day of Week", fill = "Day of Week")
+
+
+```
+
+
+
+
+
+
